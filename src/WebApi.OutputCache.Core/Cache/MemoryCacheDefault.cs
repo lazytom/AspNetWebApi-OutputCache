@@ -9,7 +9,7 @@ namespace WebApi.OutputCache.Core.Cache
     {
         private static readonly MemoryCache Cache = MemoryCache.Default;
 
-        public void RemoveStartsWith(string key)
+        public virtual void RemoveStartsWith(string key)
         {
             lock (Cache)
             {
@@ -17,18 +17,19 @@ namespace WebApi.OutputCache.Core.Cache
             }
         }
 
-        public T Get<T>(string key) where T : class
+        public virtual T Get<T>(string key) where T : class
         {
             var o = Cache.Get(key) as T;
             return o;
         }
 
-        public object Get(string key)
+        [Obsolete("Use Get<T> instead")]
+        public virtual object Get(string key)
         {
             return Cache.Get(key);
         }
 
-        public void Remove(string key)
+        public virtual void Remove(string key)
         {
             lock (Cache)
             {
@@ -36,12 +37,12 @@ namespace WebApi.OutputCache.Core.Cache
             }
         }
 
-        public bool Contains(string key)
+        public virtual bool Contains(string key)
         {
             return Cache.Contains(key);
         }
 
-        public void Add(string key, object o, DateTimeOffset expiration, string dependsOnKey = null)
+        public virtual void Add(string key, object o, DateTimeOffset expiration, string dependsOnKey = null)
         {
             var cachePolicy = new CacheItemPolicy
             {
@@ -60,7 +61,7 @@ namespace WebApi.OutputCache.Core.Cache
             }
         }
 
-        public IEnumerable<string> AllKeys
+        public virtual IEnumerable<string> AllKeys
         {
             get
             {

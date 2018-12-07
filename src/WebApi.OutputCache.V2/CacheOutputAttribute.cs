@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Net.Http.Formatting;
 using System.Net.Http.Headers;
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -17,9 +18,10 @@ using WebApi.OutputCache.Core.Time;
 
 namespace WebApi.OutputCache.V2
 {
-    [AttributeUsage(AttributeTargets.Method, AllowMultiple = false, Inherited = true)]
-    public class CacheOutputAttribute : FilterAttribute, IActionFilter
+    [AttributeUsage(AttributeTargets.Method | AttributeTargets.Class, AllowMultiple = false, Inherited = true)]
+    public class CacheOutputAttribute : ActionFilterAttribute
     {
+        private const string CurrentRequestMediaType = "CacheOutput:CurrentRequestMediaType";
         protected static MediaTypeHeaderValue DefaultMediaType = new MediaTypeHeaderValue("application/json") {CharSet = Encoding.UTF8.HeaderName};
 
         /// <summary>
@@ -47,6 +49,23 @@ namespace WebApi.OutputCache.V2
         /// </summary>
         public int ClientTimeSpan { get; set; }
 
+        
+        private int? _sharedTimeSpan = null;
+
+        /// <summary>
+        /// Corresponds to CacheControl Shared MaxAge HTTP header (in seconds)
+        /// </summary>
+        public int SharedTimeSpan
+        {
+            get // required for property visibility
+            {
+                if (!_sharedTimeSpan.HasValue)
+                    throw new Exception("should not be called without value set"); 
+                return _sharedTimeSpan.Value;
+            }
+            set { _sharedTimeSpan = value; }
+        }
+
         /// <summary>
         /// Corresponds to CacheControl NoCache HTTP header
         /// </summary>
@@ -61,9 +80,12 @@ namespace WebApi.OutputCache.V2
         /// Class used to generate caching keys
         /// </summary>
         public Type CacheKeyGenerator { get; set; }
-        
-        private MediaTypeHeaderValue _responseMediaType;
-        
+
+        /// <summary>
+        /// If set to something else than an empty string, this value will always be used for the Content-Type header, regardless of content negotiation.
+        /// </summary>
+        public string MediaType { get; set; }
+
         // cache repository
         private IApiOutputCache _webApiCache;
 
@@ -74,14 +96,23 @@ namespace WebApi.OutputCache.V2
 
         internal IModelQuery<DateTime, CacheTime> CacheTimeQuery;
 
-        readonly Func<HttpActionContext, bool, bool> _isCachingAllowed = (ac, anonymous) =>
+        protected virtual bool IsCachingAllowed(HttpActionContext actionContext, bool anonymousOnly)
         {
-            if (anonymous)
+            if (anonymousOnly)
+            {
                 if (Thread.CurrentPrincipal.Identity.IsAuthenticated)
+                {
                     return false;
+                }
+            }
 
-            return ac.Request.Method == HttpMethod.Get;
-        };
+            if (actionContext.ActionDescriptor.GetCustomAttributes<IgnoreCacheOutputAttribute>().Any())
+            {
+                return false;
+            }
+
+            return actionContext.Request.Method == HttpMethod.Get;
+        }
 
         protected virtual void EnsureCacheTimeQuery()
         {
@@ -90,19 +121,30 @@ namespace WebApi.OutputCache.V2
 
         protected void ResetCacheTimeQuery()
         {
-            CacheTimeQuery = new ShortTime( ServerTimeSpan, ClientTimeSpan );
+            CacheTimeQuery = new ShortTime( ServerTimeSpan, ClientTimeSpan, _sharedTimeSpan);
         }
 
         protected virtual MediaTypeHeaderValue GetExpectedMediaType(HttpConfiguration config, HttpActionContext actionContext)
         {
+            if (!string.IsNullOrEmpty(MediaType))
+            {
+                return new MediaTypeHeaderValue(MediaType);
+            }
+
             MediaTypeHeaderValue responseMediaType = null;
 
             var negotiator = config.Services.GetService(typeof(IContentNegotiator)) as IContentNegotiator;
             var returnType = actionContext.ActionDescriptor.ReturnType;
 
-            if (negotiator != null && returnType != typeof(HttpResponseMessage))
+            if (negotiator != null && returnType != typeof(HttpResponseMessage) && (returnType != typeof(IHttpActionResult) || typeof(IHttpActionResult).IsAssignableFrom(returnType)))
             {
                 var negotiatedResult = negotiator.Negotiate(returnType, actionContext.Request, config.Formatters);
+
+                if (negotiatedResult == null)
+                {
+                    return DefaultMediaType;
+                }
+
                 responseMediaType = negotiatedResult.MediaType;
                 if (string.IsNullOrWhiteSpace(responseMediaType.CharSet))
                 {
@@ -114,8 +156,7 @@ namespace WebApi.OutputCache.V2
                 if (actionContext.Request.Headers.Accept != null)
                 {
                     responseMediaType = actionContext.Request.Headers.Accept.FirstOrDefault();
-                    if (responseMediaType == null ||
-                        !config.Formatters.Any(x => x.SupportedMediaTypes.Contains(responseMediaType)))
+                    if (responseMediaType == null || !config.Formatters.Any(x => x.SupportedMediaTypes.Any(value => value.MediaType == responseMediaType.MediaType)))
                     {
                         return DefaultMediaType;
                     }
@@ -125,11 +166,11 @@ namespace WebApi.OutputCache.V2
             return responseMediaType;
         }
 
-        private void OnActionExecuting(HttpActionContext actionContext)
+        public override void OnActionExecuting(HttpActionContext actionContext)
         {
             if (actionContext == null) throw new ArgumentNullException("actionContext");
 
-            if (!_isCachingAllowed(actionContext, AnonymousOnly)) return;
+            if (!IsCachingAllowed(actionContext, AnonymousOnly)) return;
 
             var config = actionContext.Request.GetConfiguration();
 
@@ -138,14 +179,15 @@ namespace WebApi.OutputCache.V2
 
             var cacheKeyGenerator = config.CacheOutputConfiguration().GetCacheKeyGenerator(actionContext.Request, CacheKeyGenerator);
 
-            _responseMediaType = GetExpectedMediaType(config, actionContext);
-            var cachekey = cacheKeyGenerator.MakeCacheKey(actionContext, _responseMediaType, ExcludeQueryStringFromCacheKey);
+            var responseMediaType = GetExpectedMediaType(config, actionContext);
+            actionContext.Request.Properties[CurrentRequestMediaType] = responseMediaType;
+            var cachekey = cacheKeyGenerator.MakeCacheKey(actionContext, responseMediaType, ExcludeQueryStringFromCacheKey);
 
             if (!_webApiCache.Contains(cachekey)) return;
 
             if (actionContext.Request.Headers.IfNoneMatch != null)
             {
-                var etag = _webApiCache.Get(cachekey + Constants.EtagKey) as string;
+                var etag = _webApiCache.Get<string>(cachekey + Constants.EtagKey);
                 if (etag != null)
                 {
                     if (actionContext.Request.Headers.IfNoneMatch.Any(x => x.Tag ==  etag))
@@ -159,48 +201,64 @@ namespace WebApi.OutputCache.V2
                 }
             }
 
-            var val = _webApiCache.Get(cachekey) as byte[];
+            var val = _webApiCache.Get<byte[]>(cachekey);
             if (val == null) return;
 
-            var contenttype = _webApiCache.Get(cachekey + Constants.ContentTypeKey) as MediaTypeHeaderValue ?? new MediaTypeHeaderValue(cachekey.Split(new[] {':'},2)[1]);
+            var contenttype = _webApiCache.Get<MediaTypeHeaderValue>(cachekey + Constants.ContentTypeKey) ?? responseMediaType;
+            var contentGeneration = _webApiCache.Get<string>(cachekey + Constants.GenerationTimestampKey);
+
+            DateTimeOffset? contentGenerationTimestamp = null;
+            if (contentGeneration != null)
+            {
+                if (DateTimeOffset.TryParse(contentGeneration, out DateTimeOffset parsedContentGenerationTimestamp))
+                {
+                    contentGenerationTimestamp = parsedContentGenerationTimestamp;
+                }
+            };
 
             actionContext.Response = actionContext.Request.CreateResponse();
             actionContext.Response.Content = new ByteArrayContent(val);
 
             actionContext.Response.Content.Headers.ContentType = contenttype;
-            var responseEtag = _webApiCache.Get(cachekey + Constants.EtagKey) as string;
+            var responseEtag = _webApiCache.Get<string>(cachekey + Constants.EtagKey);
             if (responseEtag != null) SetEtag(actionContext.Response,  responseEtag);
 
             var cacheTime = CacheTimeQuery.Execute(DateTime.Now);
-            ApplyCacheHeaders(actionContext.Response, cacheTime);
+            ApplyCacheHeaders(actionContext.Response, cacheTime, contentGenerationTimestamp);
         }
 
-        private async Task OnActionExecuted(HttpActionExecutedContext actionExecutedContext)
+        public override async Task OnActionExecutedAsync(HttpActionExecutedContext actionExecutedContext, CancellationToken cancellationToken)
         {
             if (actionExecutedContext.ActionContext.Response == null || !actionExecutedContext.ActionContext.Response.IsSuccessStatusCode) return;
 
-            if (!_isCachingAllowed(actionExecutedContext.ActionContext, AnonymousOnly)) return;
+            if (!IsCachingAllowed(actionExecutedContext.ActionContext, AnonymousOnly)) return;
 
-            var cacheTime = CacheTimeQuery.Execute(DateTime.Now);
-            if (cacheTime.AbsoluteExpiration > DateTime.Now)
+            var actionExecutionTimestamp = DateTimeOffset.Now;
+            var cacheTime = CacheTimeQuery.Execute(actionExecutionTimestamp.DateTime);
+            if (cacheTime.AbsoluteExpiration > actionExecutionTimestamp)
             {
-                var config = actionExecutedContext.Request.GetConfiguration().CacheOutputConfiguration();
+                var httpConfig = actionExecutedContext.Request.GetConfiguration();
+                var config = httpConfig.CacheOutputConfiguration();
                 var cacheKeyGenerator = config.GetCacheKeyGenerator(actionExecutedContext.Request, CacheKeyGenerator);
 
-                var cachekey = cacheKeyGenerator.MakeCacheKey(actionExecutedContext.ActionContext, _responseMediaType, ExcludeQueryStringFromCacheKey);
+                var responseMediaType = actionExecutedContext.Request.Properties[CurrentRequestMediaType] as MediaTypeHeaderValue ?? GetExpectedMediaType(httpConfig, actionExecutedContext.ActionContext);
+                var cachekey = cacheKeyGenerator.MakeCacheKey(actionExecutedContext.ActionContext, responseMediaType, ExcludeQueryStringFromCacheKey);
 
                 if (!string.IsNullOrWhiteSpace(cachekey) && !(_webApiCache.Contains(cachekey)))
                 {
-                    SetEtag(actionExecutedContext.Response, Guid.NewGuid().ToString());
+                    SetEtag(actionExecutedContext.Response, CreateEtag(actionExecutedContext, cachekey, cacheTime));
 
-                    if (actionExecutedContext.Response.Content != null)
+                    var responseContent = actionExecutedContext.Response.Content;
+
+                    if (responseContent != null)
                     {
-                        var baseKey = config.MakeBaseCachekey(actionExecutedContext.ActionContext.ControllerContext.ControllerDescriptor.ControllerName, actionExecutedContext.ActionContext.ActionDescriptor.ActionName);
-                        var contentType = actionExecutedContext.Response.Content.Headers.ContentType;
+                        var baseKey = config.MakeBaseCachekey(actionExecutedContext.ActionContext.ControllerContext.ControllerDescriptor.ControllerType.FullName, actionExecutedContext.ActionContext.ActionDescriptor.ActionName);
+                        var contentType = responseContent.Headers.ContentType;
                         string etag = actionExecutedContext.Response.Headers.ETag.Tag;
                         //ConfigureAwait false to avoid deadlocks
-                        var content = await actionExecutedContext.Response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                        
+                        var content = await responseContent.ReadAsByteArrayAsync().ConfigureAwait(false);
+
+                        responseContent.Headers.Remove("Content-Length");
 
                         _webApiCache.Add(baseKey, string.Empty, cacheTime.AbsoluteExpiration);
                         _webApiCache.Add(cachekey, content, cacheTime.AbsoluteExpiration, baseKey);
@@ -214,20 +272,26 @@ namespace WebApi.OutputCache.V2
                         _webApiCache.Add(cachekey + Constants.EtagKey,
                                         etag,
                                         cacheTime.AbsoluteExpiration, baseKey);
+
+
+                        _webApiCache.Add(cachekey + Constants.GenerationTimestampKey,
+                                        actionExecutionTimestamp.ToString(),
+                                        cacheTime.AbsoluteExpiration, baseKey);
                     }
                 }
             }
 
-            ApplyCacheHeaders(actionExecutedContext.ActionContext.Response, cacheTime);
+            ApplyCacheHeaders(actionExecutedContext.ActionContext.Response, cacheTime, actionExecutionTimestamp);
         }
 
-        protected virtual void ApplyCacheHeaders(HttpResponseMessage response, CacheTime cacheTime)
+        protected virtual void ApplyCacheHeaders(HttpResponseMessage response, CacheTime cacheTime, DateTimeOffset? contentGenerationTimestamp = null)
         {
             if (cacheTime.ClientTimeSpan > TimeSpan.Zero || MustRevalidate || Private)
             {
                 var cachecontrol = new CacheControlHeaderValue
                                        {
                                            MaxAge = cacheTime.ClientTimeSpan,
+                                           SharedMaxAge = cacheTime.SharedTimeSpan,
                                            MustRevalidate = MustRevalidate,
                                            Private = Private
                                        };
@@ -239,6 +303,15 @@ namespace WebApi.OutputCache.V2
                 response.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
                 response.Headers.Add("Pragma", "no-cache");
             }
+            if ((response.Content != null) && contentGenerationTimestamp.HasValue)
+            {
+                response.Content.Headers.LastModified = contentGenerationTimestamp.Value;
+            }
+        }
+
+        protected virtual string CreateEtag(HttpActionExecutedContext actionExecutedContext, string cachekey, CacheTime cacheTime)
+        {
+            return Guid.NewGuid().ToString();
         }
 
         private static void SetEtag(HttpResponseMessage message, string etag)
@@ -249,67 +322,5 @@ namespace WebApi.OutputCache.V2
                 message.Headers.ETag = eTag;
             }
         }
-
-        Task<HttpResponseMessage> IActionFilter.ExecuteActionFilterAsync(HttpActionContext actionContext, CancellationToken cancellationToken, Func<Task<HttpResponseMessage>> continuation)
-        {
-            if (actionContext == null)
-            {
-                throw new ArgumentNullException("actionContext");
-            }
-
-            if (continuation == null)
-            {
-                throw new ArgumentNullException("continuation");
-            }
-
-            OnActionExecuting(actionContext);
-
-            if (actionContext.Response != null)
-            {
-                return Task.FromResult(actionContext.Response);
-            }
-
-            return CallOnActionExecutedAsync(actionContext, cancellationToken, continuation);
-        }
-
-        private async Task<HttpResponseMessage> CallOnActionExecutedAsync(HttpActionContext actionContext, CancellationToken cancellationToken, Func<Task<HttpResponseMessage>> continuation)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            HttpResponseMessage response = null;
-            Exception exception = null;
-            try
-            {
-                response = await continuation();
-            }
-            catch (Exception e)
-            {
-                exception = e;
-            }
-
-            try
-            {
-                var executedContext = new HttpActionExecutedContext(actionContext, exception) { Response = response };
-                await OnActionExecuted(executedContext);
-
-                if (executedContext.Response != null)
-                {
-                    return executedContext.Response;
-                }
-
-                if (executedContext.Exception != null)
-                {
-                    ExceptionDispatchInfo.Capture(executedContext.Exception).Throw();
-                }
-            }
-            catch (Exception e)
-            {
-                actionContext.Response = null;
-                ExceptionDispatchInfo.Capture(e).Throw();
-            }
-
-            throw new InvalidOperationException(GetType().Name);
-        }
-
     }
 } 
